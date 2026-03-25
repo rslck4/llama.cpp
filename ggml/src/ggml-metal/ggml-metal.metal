@@ -27,6 +27,8 @@ using namespace metal;
 
 #define N_SIMDWIDTH 32 // assuming SIMD group size is 32
 
+#include "tbq-metal.h"
+
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //
 // cmd:
@@ -8934,6 +8936,32 @@ kernel void kernel_mul_mv_mxfp4_f32(
     kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// --- TurboQuant MUL_MV kernels ---
+
+kernel void kernel_mul_mv_tbq4_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_mv_tbq4_0_f32_impl<N_R0_TBQ4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_tbq3_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_mv_tbq3_0_f32_impl<N_R0_TBQ3_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+}
+
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
 kernel void kernel_get_rows_q(
         constant ggml_metal_kargs_get_rows & args,
@@ -9022,6 +9050,38 @@ kernel void kernel_set_rows_q32(
 
     for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
         quantize_func(src_row + 32*ind, dst_row[ind]);
+    }
+}
+
+// TBQ variant: 64 elements per block (QK_TBQ=64)
+template<typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
+kernel void kernel_set_rows_q64(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+
+    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+          device block_q * dst_row = (      device block_q *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+    const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
+        quantize_func(src_row + QK_TBQ*ind, dst_row[ind]);
     }
 }
 
@@ -9797,6 +9857,10 @@ template [[host_name("kernel_get_rows_iq1_m")]]   kernel get_rows_q_t kernel_get
 template [[host_name("kernel_get_rows_iq4_nl")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_nl,  2,     dequantize_iq4_nl>;
 template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
 
+// TBQ GET_ROWS: nl=4 because QK_TBQ=64 / 16 = 4 interleave groups
+template [[host_name("kernel_get_rows_tbq4_0")]]  kernel get_rows_q_t kernel_get_rows_q<block_tbq4_0, 4, dequantize_tbq4_0>;
+template [[host_name("kernel_get_rows_tbq3_0")]]  kernel get_rows_q_t kernel_get_rows_q<block_tbq3_0, 4, dequantize_tbq3_0>;
+
 //
 // set rows
 //
@@ -9826,6 +9890,14 @@ template [[host_name("kernel_set_rows_q5_1_i64")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
+
+// TBQ SET_ROWS: uses q64 template (QK_TBQ=64 elements per block)
+typedef decltype(kernel_set_rows_q64<int64_t, block_tbq4_0, quantize_tbq4_0>) set_rows_q64_t;
+
+template [[host_name("kernel_set_rows_tbq4_0_i64")]] kernel set_rows_q64_t kernel_set_rows_q64<int64_t, block_tbq4_0, quantize_tbq4_0>;
+template [[host_name("kernel_set_rows_tbq4_0_i32")]] kernel set_rows_q64_t kernel_set_rows_q64<int32_t, block_tbq4_0, quantize_tbq4_0>;
+template [[host_name("kernel_set_rows_tbq3_0_i64")]] kernel set_rows_q64_t kernel_set_rows_q64<int64_t, block_tbq3_0, quantize_tbq3_0>;
+template [[host_name("kernel_set_rows_tbq3_0_i32")]] kernel set_rows_q64_t kernel_set_rows_q64<int32_t, block_tbq3_0, quantize_tbq3_0>;
 
 //
 // matrix-matrix multiplication
