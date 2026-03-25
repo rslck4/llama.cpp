@@ -2583,17 +2583,18 @@ static void tbq_unpack_3bit(uint8_t * out, const uint8_t * in, int n) {
     }
 }
 
-// --- Quantize: float -> TurboQuant block ---
+// --- Quantize: float -> TurboQuant blocks ---
+// Each block is self-contained: own norm, own rotation over QK_TBQ elements.
+// This is required because llama.cpp views KV cache per-head, and each head
+// must be independently dequantizable.
 
 void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TBQ == 0);
     const int64_t nb = k / QK_TBQ;
-    const int d = (int)k;  // Total vector dimension (head_dim or multiple thereof)
 
     const float * Q = tbq_get_rotation(QK_TBQ);
     const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
 
-    // Scale boundaries for this block size
     float boundaries[7];
     for (int i = 0; i < 7; i++) {
         boundaries[i] = tbq3_boundaries_unit[i] * inv_sqrt_d;
@@ -2603,48 +2604,43 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
     uint8_t indices[QK_TBQ];
 
     for (int64_t bi = 0; bi < nb; bi++) {
-        const float * vec = x + bi * QK_TBQ;
+        const float * bx = x + bi * QK_TBQ;
 
-        // 1. Compute L2 norm
+        // 1. Compute L2 norm of this block
         float norm = 0.0f;
         for (int i = 0; i < QK_TBQ; i++) {
-            norm += vec[i] * vec[i];
+            norm += bx[i] * bx[i];
         }
         norm = sqrtf(norm);
 
-        // Store norm in block (first block of the vector gets the real norm)
-        y[bi].d = GGML_FP32_TO_FP16(norm);
-
         if (norm < 1e-10f) {
+            y[bi].d = GGML_FP32_TO_FP16(0.0f);
             memset(y[bi].qs, 0, sizeof(y[bi].qs));
             continue;
         }
 
+        y[bi].d = GGML_FP32_TO_FP16(norm);
         float inv_norm = 1.0f / norm;
 
-        // 2. Normalize and rotate: rotated = Q * (vec / norm)
+        // 2. Normalize and rotate: rotated = Q * (bx / norm)
         for (int i = 0; i < QK_TBQ; i++) {
             float sum = 0.0f;
             for (int j = 0; j < QK_TBQ; j++) {
-                sum += Q[i * QK_TBQ + j] * vec[j] * inv_norm;
+                sum += Q[i * QK_TBQ + j] * bx[j] * inv_norm;
             }
             rotated[i] = sum;
         }
 
-        // 3. Quantize each coordinate via boundary lookup
+        // 3. Quantize via boundary lookup
         for (int i = 0; i < QK_TBQ; i++) {
-            float val = rotated[i];
-            // Binary search on 7 boundaries -> index 0-7
             uint8_t idx = 0;
             for (int b = 0; b < 7; b++) {
-                if (val > boundaries[b]) {
-                    idx = b + 1;
-                }
+                if (rotated[i] > boundaries[b]) idx = b + 1;
             }
             indices[i] = idx;
         }
 
-        // 4. Pack 3-bit indices
+        // 4. Pack
         tbq_pack_3bit(y[bi].qs, indices, QK_TBQ);
     }
 }
@@ -2664,35 +2660,34 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
     float rotated[QK_TBQ];
 
     for (int64_t bi = 0; bi < nb; bi++) {
-        const float * vec = x + bi * QK_TBQ;
+        const float * bx = x + bi * QK_TBQ;
 
         // 1. Compute L2 norm
         float norm = 0.0f;
         for (int i = 0; i < QK_TBQ; i++) {
-            norm += vec[i] * vec[i];
+            norm += bx[i] * bx[i];
         }
         norm = sqrtf(norm);
 
-        y[bi].d = GGML_FP32_TO_FP16(norm);
-
         if (norm < 1e-10f) {
+            y[bi].d = GGML_FP32_TO_FP16(0.0f);
             memset(y[bi].qs, 0, sizeof(y[bi].qs));
             continue;
         }
 
+        y[bi].d = GGML_FP32_TO_FP16(norm);
         float inv_norm = 1.0f / norm;
 
         // 2. Normalize and rotate
         for (int i = 0; i < QK_TBQ; i++) {
             float sum = 0.0f;
             for (int j = 0; j < QK_TBQ; j++) {
-                sum += Q[i * QK_TBQ + j] * vec[j] * inv_norm;
+                sum += Q[i * QK_TBQ + j] * bx[j] * inv_norm;
             }
             rotated[i] = sum;
         }
 
-        // 3. Quantize each coordinate (4-bit: 16 centroids, 15 boundaries)
-        // 4. Pack as nibbles
+        // 3. Quantize and pack into nibbles
         for (int i = 0; i < QK_TBQ / 2; i++) {
             float val_lo = rotated[2 * i];
             float val_hi = rotated[2 * i + 1];
@@ -2701,7 +2696,6 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
             for (int b = 0; b < 15; b++) {
                 if (val_lo > boundaries[b]) idx_lo = b + 1;
             }
-
             uint8_t idx_hi = 0;
             for (int b = 0; b < 15; b++) {
                 if (val_hi > boundaries[b]) idx_hi = b + 1;
@@ -2712,7 +2706,8 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
     }
 }
 
-// --- Dequantize: TurboQuant block -> float ---
+// --- Dequantize: TurboQuant blocks -> float ---
+// Each block is self-contained: read norm, unpack, inverse rotate, rescale.
 
 void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TBQ == 0);
@@ -2721,42 +2716,36 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
     const float * Q = tbq_get_rotation(QK_TBQ);
     const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
 
-    // Scale centroids for this block size
     float centroids[8];
     for (int i = 0; i < 8; i++) {
         centroids[i] = tbq3_centroids_unit[i] * inv_sqrt_d;
     }
 
-    uint8_t indices[QK_TBQ];
     float rotated[QK_TBQ];
+    uint8_t indices[QK_TBQ];
 
     for (int64_t bi = 0; bi < nb; bi++) {
+        float * by = y + bi * QK_TBQ;
         const float norm = GGML_FP16_TO_FP32(x[bi].d);
 
         if (norm < 1e-10f) {
-            for (int i = 0; i < QK_TBQ; i++) {
-                y[bi * QK_TBQ + i] = 0.0f;
-            }
+            for (int i = 0; i < QK_TBQ; i++) by[i] = 0.0f;
             continue;
         }
 
-        // 1. Unpack 3-bit indices
+        // 1. Unpack indices and map to centroids
         tbq_unpack_3bit(indices, x[bi].qs, QK_TBQ);
-
-        // 2. Codebook lookup -> rotated coordinates
         for (int i = 0; i < QK_TBQ; i++) {
             rotated[i] = centroids[indices[i]];
         }
 
-        // 3. Inverse rotation: vec = Q^T * rotated (Q is orthogonal, so Q^T = Q^-1)
-        // Q is row-major: Q[i][j] = Q[i*d+j]
-        // Q^T multiply: out[j] = sum_i Q[i][j] * rotated[i] = sum_i Q[i*d+j] * rotated[i]
+        // 2. Inverse rotation: by = Q^T * rotated, then rescale
         for (int j = 0; j < QK_TBQ; j++) {
             float sum = 0.0f;
             for (int i = 0; i < QK_TBQ; i++) {
                 sum += Q[i * QK_TBQ + j] * rotated[i];
             }
-            y[bi * QK_TBQ + j] = sum * norm;
+            by[j] = sum * norm;
         }
     }
 }
@@ -2776,21 +2765,18 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     float rotated[QK_TBQ];
 
     for (int64_t bi = 0; bi < nb; bi++) {
+        float * by = y + bi * QK_TBQ;
         const float norm = GGML_FP16_TO_FP32(x[bi].d);
 
         if (norm < 1e-10f) {
-            for (int i = 0; i < QK_TBQ; i++) {
-                y[bi * QK_TBQ + i] = 0.0f;
-            }
+            for (int i = 0; i < QK_TBQ; i++) by[i] = 0.0f;
             continue;
         }
 
-        // 1. Unpack 4-bit nibbles -> codebook lookup
+        // 1. Unpack nibbles to centroids
         for (int i = 0; i < QK_TBQ / 2; i++) {
-            uint8_t idx_lo = x[bi].qs[i] & 0x0F;
-            uint8_t idx_hi = x[bi].qs[i] >> 4;
-            rotated[2 * i]     = centroids[idx_lo];
-            rotated[2 * i + 1] = centroids[idx_hi];
+            rotated[2 * i]     = centroids[x[bi].qs[i] & 0x0F];
+            rotated[2 * i + 1] = centroids[x[bi].qs[i] >> 4];
         }
 
         // 2. Inverse rotation and rescale
@@ -2799,7 +2785,7 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
             for (int i = 0; i < QK_TBQ; i++) {
                 sum += Q[i * QK_TBQ + j] * rotated[i];
             }
-            y[bi * QK_TBQ + j] = sum * norm;
+            by[j] = sum * norm;
         }
     }
 }
@@ -2809,14 +2795,20 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
 size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights;
     const size_t row_size = ggml_row_size(GGML_TYPE_TBQ3_0, n_per_row);
-    quantize_row_tbq3_0_ref(src, (block_tbq3_0 *)dst, (int64_t)nrow * n_per_row);
+    for (int64_t r = 0; r < nrow; r++) {
+        quantize_row_tbq3_0_ref(src + r * n_per_row,
+                                (block_tbq3_0 *)((char *)dst + r * row_size), n_per_row);
+    }
     return nrow * row_size;
 }
 
 size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights;
     const size_t row_size = ggml_row_size(GGML_TYPE_TBQ4_0, n_per_row);
-    quantize_row_tbq4_0_ref(src, (block_tbq4_0 *)dst, (int64_t)nrow * n_per_row);
+    for (int64_t r = 0; r < nrow; r++) {
+        quantize_row_tbq4_0_ref(src + r * n_per_row,
+                                (block_tbq4_0 *)((char *)dst + r * row_size), n_per_row);
+    }
     return nrow * row_size;
 }
 

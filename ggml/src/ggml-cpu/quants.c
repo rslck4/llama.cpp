@@ -108,6 +108,56 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    block_tbq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq3_0_ref(x, y, k);
+}
+
+void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    block_tbq4_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq4_0_ref(x, y, k);
+}
+
+// TurboQuant vec_dot: dequantize full row, then F32 dot product.
+// Slow but correct — rotation couples all elements so block-level dot is impossible.
+void ggml_vec_dot_tbq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    float * tmp = (float *)malloc(n * sizeof(float));
+    dequantize_row_tbq3_0((const block_tbq3_0 *)vx, tmp, n);
+
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += tmp[i] * y[i];
+    }
+    *s = sum;
+    free(tmp);
+}
+
+void ggml_vec_dot_tbq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    float * tmp = (float *)malloc(n * sizeof(float));
+    dequantize_row_tbq4_0((const block_tbq4_0 *)vx, tmp, n);
+
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += tmp[i] * y[i];
+    }
+    *s = sum;
+    free(tmp);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
