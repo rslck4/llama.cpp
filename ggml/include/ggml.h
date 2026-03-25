@@ -428,7 +428,9 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_COUNT   = 41,
+        GGML_TYPE_TBQ3_0  = 41, // TurboQuant 3-bit KV cache (arxiv 2504.19874)
+        GGML_TYPE_TBQ4_0  = 42, // TurboQuant 4-bit KV cache
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision

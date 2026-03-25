@@ -2336,6 +2336,490 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== TurboQuant KV cache compression (arxiv 2504.19874)
+// Algorithm 1 (TurboQuant_mse): random rotation → Lloyd-Max scalar quantization
+// Rotation matrix generated deterministically from seeded PRNG via Householder QR.
+
+// --- PRNG: splitmix64 for deterministic rotation matrix generation ---
+
+static uint64_t tbq_splitmix64(uint64_t * state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+// Box-Muller: two uniform -> two gaussian
+static void tbq_box_muller(uint64_t * state, float * g1, float * g2) {
+    uint64_t u1_bits = tbq_splitmix64(state);
+    uint64_t u2_bits = tbq_splitmix64(state);
+    // Map to (0, 1) — avoid exact 0
+    double u1 = ((double)(u1_bits >> 11) + 0.5) / (double)(1ULL << 53);
+    double u2 = ((double)(u2_bits >> 11) + 0.5) / (double)(1ULL << 53);
+    double r = sqrt(-2.0 * log(u1));
+    *g1 = (float)(r * cos(2.0 * M_PI * u2));
+    *g2 = (float)(r * sin(2.0 * M_PI * u2));
+}
+
+// --- Rotation matrix: Householder QR of random Gaussian ---
+// Generates a d x d orthogonal matrix deterministically from seed.
+// Stored in row-major order: Q[i*d + j].
+
+static void tbq_generate_rotation(int d, uint64_t seed, float * Q) {
+    // Fill d x d with N(0,1)
+    uint64_t state = seed;
+    for (int i = 0; i < d * d - 1; i += 2) {
+        tbq_box_muller(&state, &Q[i], &Q[i + 1]);
+    }
+    if ((d * d) % 2 != 0) {
+        float dummy;
+        tbq_box_muller(&state, &Q[d * d - 1], &dummy);
+    }
+
+    // Householder QR decomposition (in-place, overwrites Q with orthogonal matrix)
+    // We need workspace for the Householder vectors
+    float * v = (float *)malloc(d * sizeof(float));
+    float * tau = (float *)malloc(d * sizeof(float));
+
+    for (int j = 0; j < d; j++) {
+        // Compute Householder vector for column j
+        float norm_sq = 0.0f;
+        for (int i = j; i < d; i++) {
+            norm_sq += Q[i * d + j] * Q[i * d + j];
+        }
+        float norm = sqrtf(norm_sq);
+        float sign = Q[j * d + j] >= 0.0f ? 1.0f : -1.0f;
+        float alpha = -sign * norm;
+
+        // v = column below diagonal, with v[0] adjusted
+        for (int i = j; i < d; i++) {
+            v[i - j] = Q[i * d + j];
+        }
+        v[0] -= alpha;
+
+        // tau = 2 / (v^T v)
+        float vtv = 0.0f;
+        for (int i = 0; i < d - j; i++) {
+            vtv += v[i] * v[i];
+        }
+        tau[j] = vtv > 0.0f ? 2.0f / vtv : 0.0f;
+
+        // Apply Householder to trailing submatrix: Q[j:,j:] -= tau * v * (v^T * Q[j:,j:])
+        for (int k = j; k < d; k++) {
+            float dot = 0.0f;
+            for (int i = 0; i < d - j; i++) {
+                dot += v[i] * Q[(i + j) * d + k];
+            }
+            for (int i = 0; i < d - j; i++) {
+                Q[(i + j) * d + k] -= tau[j] * v[i] * dot;
+            }
+        }
+    }
+
+    // Extract Q from the implicit representation:
+    // Start with identity, apply Householder reflectors in reverse
+    // Actually, the matrix is already transformed — the upper triangle contains R,
+    // and we need to reconstruct Q explicitly.
+
+    // Simpler approach: the above modified Q in-place. Let's extract Q properly.
+    // Re-do from scratch with explicit Q accumulation.
+
+    // Reset: regenerate the random matrix A
+    state = seed;
+    float * A = (float *)malloc(d * d * sizeof(float));
+    for (int i = 0; i < d * d - 1; i += 2) {
+        tbq_box_muller(&state, &A[i], &A[i + 1]);
+    }
+    if ((d * d) % 2 != 0) {
+        float dummy;
+        tbq_box_muller(&state, &A[d * d - 1], &dummy);
+    }
+
+    // Modified Gram-Schmidt for QR (simpler, gives Q directly)
+    // Q columns are orthonormal basis from A columns
+    for (int j = 0; j < d; j++) {
+        // Copy column j of A into Q column j
+        for (int i = 0; i < d; i++) {
+            Q[i * d + j] = A[i * d + j];
+        }
+        // Subtract projections onto previous Q columns
+        for (int k = 0; k < j; k++) {
+            float dot = 0.0f;
+            for (int i = 0; i < d; i++) {
+                dot += Q[i * d + k] * Q[i * d + j];
+            }
+            for (int i = 0; i < d; i++) {
+                Q[i * d + j] -= dot * Q[i * d + k];
+            }
+        }
+        // Normalize
+        float norm = 0.0f;
+        for (int i = 0; i < d; i++) {
+            norm += Q[i * d + j] * Q[i * d + j];
+        }
+        norm = sqrtf(norm);
+        if (norm > 0.0f) {
+            for (int i = 0; i < d; i++) {
+                Q[i * d + j] /= norm;
+            }
+        }
+    }
+
+    // Haar sign correction: ensure deterministic orientation
+    // (Without this, the sign of each column is arbitrary)
+    // Convention: make diagonal of R positive by flipping Q columns where R_jj < 0
+    for (int j = 0; j < d; j++) {
+        float r_jj = 0.0f;
+        for (int i = 0; i < d; i++) {
+            r_jj += Q[i * d + j] * A[i * d + j];
+        }
+        if (r_jj < 0.0f) {
+            for (int i = 0; i < d; i++) {
+                Q[i * d + j] = -Q[i * d + j];
+            }
+        }
+    }
+
+    free(A);
+    free(v);
+    free(tau);
+}
+
+// --- Thread-local rotation matrix cache ---
+
+// Seed for a given head dimension (deterministic, fixed)
+static uint64_t tbq_seed_for_dim(int d) {
+    return 0x54425131ULL ^ (uint64_t)d;  // "TBQ1" XOR dim
+}
+
+// Cache rotation matrices per dimension
+// Thread-local to avoid synchronization in multi-threaded quantization
+#define TBQ_MAX_CACHED_DIMS 4
+typedef struct {
+    int dim;
+    float * matrix;  // row-major d x d
+} tbq_rotation_cache_entry;
+
+static _Thread_local tbq_rotation_cache_entry tbq_cache[TBQ_MAX_CACHED_DIMS] = {{0}};
+static _Thread_local int tbq_cache_count = 0;
+
+static const float * tbq_get_rotation(int d) {
+    // Check cache
+    for (int i = 0; i < tbq_cache_count; i++) {
+        if (tbq_cache[i].dim == d) {
+            return tbq_cache[i].matrix;
+        }
+    }
+    // Generate and cache
+    float * Q = (float *)malloc(d * d * sizeof(float));
+    tbq_generate_rotation(d, tbq_seed_for_dim(d), Q);
+
+    if (tbq_cache_count < TBQ_MAX_CACHED_DIMS) {
+        tbq_cache[tbq_cache_count].dim = d;
+        tbq_cache[tbq_cache_count].matrix = Q;
+        tbq_cache_count++;
+    } else {
+        // Evict oldest
+        free(tbq_cache[0].matrix);
+        for (int i = 0; i < TBQ_MAX_CACHED_DIMS - 1; i++) {
+            tbq_cache[i] = tbq_cache[i + 1];
+        }
+        tbq_cache[TBQ_MAX_CACHED_DIMS - 1].dim = d;
+        tbq_cache[TBQ_MAX_CACHED_DIMS - 1].matrix = Q;
+    }
+    return Q;
+}
+
+// --- Lloyd-Max codebook (universal N(0,1), scaled by 1/sqrt(d) at runtime) ---
+// Precomputed from MLX PoC lloyd_max_codebook() with d=128, then scaled to N(0,1)
+
+static const float tbq3_centroids_unit[8] = {
+    -2.1282f, -1.3357f, -0.7526f, -0.2443f,
+     0.2443f,  0.7526f,  1.3357f,  2.1282f
+};
+static const float tbq3_boundaries_unit[7] = {
+    -1.7320f, -1.0442f, -0.4984f, 0.0000f,
+     0.4984f,  1.0442f,  1.7320f
+};
+
+static const float tbq4_centroids_unit[16] = {
+    -2.6778f, -2.0402f, -1.6007f, -1.2450f,
+    -0.9354f, -0.6525f, -0.3859f, -0.1277f,
+     0.1277f,  0.3859f,  0.6525f,  0.9354f,
+     1.2450f,  1.6007f,  2.0402f,  2.6778f
+};
+static const float tbq4_boundaries_unit[15] = {
+    -2.3590f, -1.8204f, -1.4229f, -1.0902f,
+    -0.7940f, -0.5192f, -0.2568f, 0.0000f,
+     0.2568f,  0.5192f,  0.7940f,  1.0902f,
+     1.4229f,  1.8204f,  2.3590f
+};
+
+// --- 3-bit packing: 8 indices (0-7) into 3 bytes ---
+
+static void tbq_pack_3bit(uint8_t * out, const uint8_t * in, int n) {
+    // Pack n 3-bit values. n must be multiple of 8.
+    for (int i = 0; i < n; i += 8) {
+        // 8 values × 3 bits = 24 bits = 3 bytes
+        uint32_t packed = 0;
+        for (int j = 0; j < 8; j++) {
+            packed |= ((uint32_t)(in[i + j] & 7)) << (j * 3);
+        }
+        out[0] = (uint8_t)(packed & 0xFF);
+        out[1] = (uint8_t)((packed >> 8) & 0xFF);
+        out[2] = (uint8_t)((packed >> 16) & 0xFF);
+        out += 3;
+    }
+}
+
+static void tbq_unpack_3bit(uint8_t * out, const uint8_t * in, int n) {
+    // Unpack n 3-bit values. n must be multiple of 8.
+    for (int i = 0; i < n; i += 8) {
+        uint32_t packed = (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16);
+        for (int j = 0; j < 8; j++) {
+            out[i + j] = (packed >> (j * 3)) & 7;
+        }
+        in += 3;
+    }
+}
+
+// --- Quantize: float -> TurboQuant block ---
+
+void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    const int64_t nb = k / QK_TBQ;
+    const int d = (int)k;  // Total vector dimension (head_dim or multiple thereof)
+
+    const float * Q = tbq_get_rotation(QK_TBQ);
+    const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
+
+    // Scale boundaries for this block size
+    float boundaries[7];
+    for (int i = 0; i < 7; i++) {
+        boundaries[i] = tbq3_boundaries_unit[i] * inv_sqrt_d;
+    }
+
+    float rotated[QK_TBQ];
+    uint8_t indices[QK_TBQ];
+
+    for (int64_t bi = 0; bi < nb; bi++) {
+        const float * vec = x + bi * QK_TBQ;
+
+        // 1. Compute L2 norm
+        float norm = 0.0f;
+        for (int i = 0; i < QK_TBQ; i++) {
+            norm += vec[i] * vec[i];
+        }
+        norm = sqrtf(norm);
+
+        // Store norm in block (first block of the vector gets the real norm)
+        y[bi].d = GGML_FP32_TO_FP16(norm);
+
+        if (norm < 1e-10f) {
+            memset(y[bi].qs, 0, sizeof(y[bi].qs));
+            continue;
+        }
+
+        float inv_norm = 1.0f / norm;
+
+        // 2. Normalize and rotate: rotated = Q * (vec / norm)
+        for (int i = 0; i < QK_TBQ; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < QK_TBQ; j++) {
+                sum += Q[i * QK_TBQ + j] * vec[j] * inv_norm;
+            }
+            rotated[i] = sum;
+        }
+
+        // 3. Quantize each coordinate via boundary lookup
+        for (int i = 0; i < QK_TBQ; i++) {
+            float val = rotated[i];
+            // Binary search on 7 boundaries -> index 0-7
+            uint8_t idx = 0;
+            for (int b = 0; b < 7; b++) {
+                if (val > boundaries[b]) {
+                    idx = b + 1;
+                }
+            }
+            indices[i] = idx;
+        }
+
+        // 4. Pack 3-bit indices
+        tbq_pack_3bit(y[bi].qs, indices, QK_TBQ);
+    }
+}
+
+void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    const int64_t nb = k / QK_TBQ;
+
+    const float * Q = tbq_get_rotation(QK_TBQ);
+    const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
+
+    float boundaries[15];
+    for (int i = 0; i < 15; i++) {
+        boundaries[i] = tbq4_boundaries_unit[i] * inv_sqrt_d;
+    }
+
+    float rotated[QK_TBQ];
+
+    for (int64_t bi = 0; bi < nb; bi++) {
+        const float * vec = x + bi * QK_TBQ;
+
+        // 1. Compute L2 norm
+        float norm = 0.0f;
+        for (int i = 0; i < QK_TBQ; i++) {
+            norm += vec[i] * vec[i];
+        }
+        norm = sqrtf(norm);
+
+        y[bi].d = GGML_FP32_TO_FP16(norm);
+
+        if (norm < 1e-10f) {
+            memset(y[bi].qs, 0, sizeof(y[bi].qs));
+            continue;
+        }
+
+        float inv_norm = 1.0f / norm;
+
+        // 2. Normalize and rotate
+        for (int i = 0; i < QK_TBQ; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < QK_TBQ; j++) {
+                sum += Q[i * QK_TBQ + j] * vec[j] * inv_norm;
+            }
+            rotated[i] = sum;
+        }
+
+        // 3. Quantize each coordinate (4-bit: 16 centroids, 15 boundaries)
+        // 4. Pack as nibbles
+        for (int i = 0; i < QK_TBQ / 2; i++) {
+            float val_lo = rotated[2 * i];
+            float val_hi = rotated[2 * i + 1];
+
+            uint8_t idx_lo = 0;
+            for (int b = 0; b < 15; b++) {
+                if (val_lo > boundaries[b]) idx_lo = b + 1;
+            }
+
+            uint8_t idx_hi = 0;
+            for (int b = 0; b < 15; b++) {
+                if (val_hi > boundaries[b]) idx_hi = b + 1;
+            }
+
+            y[bi].qs[i] = idx_lo | (idx_hi << 4);
+        }
+    }
+}
+
+// --- Dequantize: TurboQuant block -> float ---
+
+void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    const int64_t nb = k / QK_TBQ;
+
+    const float * Q = tbq_get_rotation(QK_TBQ);
+    const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
+
+    // Scale centroids for this block size
+    float centroids[8];
+    for (int i = 0; i < 8; i++) {
+        centroids[i] = tbq3_centroids_unit[i] * inv_sqrt_d;
+    }
+
+    uint8_t indices[QK_TBQ];
+    float rotated[QK_TBQ];
+
+    for (int64_t bi = 0; bi < nb; bi++) {
+        const float norm = GGML_FP16_TO_FP32(x[bi].d);
+
+        if (norm < 1e-10f) {
+            for (int i = 0; i < QK_TBQ; i++) {
+                y[bi * QK_TBQ + i] = 0.0f;
+            }
+            continue;
+        }
+
+        // 1. Unpack 3-bit indices
+        tbq_unpack_3bit(indices, x[bi].qs, QK_TBQ);
+
+        // 2. Codebook lookup -> rotated coordinates
+        for (int i = 0; i < QK_TBQ; i++) {
+            rotated[i] = centroids[indices[i]];
+        }
+
+        // 3. Inverse rotation: vec = Q^T * rotated (Q is orthogonal, so Q^T = Q^-1)
+        // Q is row-major: Q[i][j] = Q[i*d+j]
+        // Q^T multiply: out[j] = sum_i Q[i][j] * rotated[i] = sum_i Q[i*d+j] * rotated[i]
+        for (int j = 0; j < QK_TBQ; j++) {
+            float sum = 0.0f;
+            for (int i = 0; i < QK_TBQ; i++) {
+                sum += Q[i * QK_TBQ + j] * rotated[i];
+            }
+            y[bi * QK_TBQ + j] = sum * norm;
+        }
+    }
+}
+
+void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    const int64_t nb = k / QK_TBQ;
+
+    const float * Q = tbq_get_rotation(QK_TBQ);
+    const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
+
+    float centroids[16];
+    for (int i = 0; i < 16; i++) {
+        centroids[i] = tbq4_centroids_unit[i] * inv_sqrt_d;
+    }
+
+    float rotated[QK_TBQ];
+
+    for (int64_t bi = 0; bi < nb; bi++) {
+        const float norm = GGML_FP16_TO_FP32(x[bi].d);
+
+        if (norm < 1e-10f) {
+            for (int i = 0; i < QK_TBQ; i++) {
+                y[bi * QK_TBQ + i] = 0.0f;
+            }
+            continue;
+        }
+
+        // 1. Unpack 4-bit nibbles -> codebook lookup
+        for (int i = 0; i < QK_TBQ / 2; i++) {
+            uint8_t idx_lo = x[bi].qs[i] & 0x0F;
+            uint8_t idx_hi = x[bi].qs[i] >> 4;
+            rotated[2 * i]     = centroids[idx_lo];
+            rotated[2 * i + 1] = centroids[idx_hi];
+        }
+
+        // 2. Inverse rotation and rescale
+        for (int j = 0; j < QK_TBQ; j++) {
+            float sum = 0.0f;
+            for (int i = 0; i < QK_TBQ; i++) {
+                sum += Q[i * QK_TBQ + j] * rotated[i];
+            }
+            y[bi * QK_TBQ + j] = sum * norm;
+        }
+    }
+}
+
+// --- Batch quantization ---
+
+size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ3_0, n_per_row);
+    quantize_row_tbq3_0_ref(src, (block_tbq3_0 *)dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ4_0, n_per_row);
+    quantize_row_tbq4_0_ref(src, (block_tbq4_0 *)dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
