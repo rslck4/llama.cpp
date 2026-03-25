@@ -2361,71 +2361,78 @@ static void tbq_box_muller(uint64_t * state, float * g1, float * g2) {
     *g2 = (float)(r * sin(2.0 * M_PI * u2));
 }
 
-// --- Rotation matrix: Householder QR of random Gaussian ---
-// Generates a d x d orthogonal matrix deterministically from seed.
-// Stored in row-major order: Q[i*d + j].
+// --- Randomized Hadamard Transform ---
+// Replaces the O(n²) random rotation with O(n log n) transform:
+//   y = (1/sqrt(d)) * H * diag(signs) * x
+// where H is the Walsh-Hadamard matrix and signs are random ±1.
+// This achieves the same decorrelation property as a random rotation
+// (Johnson-Lindenstrauss style) but is much faster and doesn't need
+// to store a d×d matrix.
+
+// Generate deterministic random sign vector from seed
+static void tbq_generate_signs(int d, uint64_t seed, int8_t * signs) {
+    uint64_t state = seed;
+    for (int i = 0; i < d; i += 64) {
+        uint64_t bits = tbq_splitmix64(&state);
+        for (int j = 0; j < 64 && (i + j) < d; j++) {
+            signs[i + j] = (bits & (1ULL << j)) ? 1 : -1;
+        }
+    }
+}
+
+// In-place Walsh-Hadamard Transform (unnormalized)
+// d must be a power of 2
+static void tbq_wht_inplace(float * x, int d) {
+    for (int len = 1; len < d; len <<= 1) {
+        for (int i = 0; i < d; i += len << 1) {
+            for (int j = 0; j < len; j++) {
+                float u = x[i + j];
+                float v = x[i + j + len];
+                x[i + j]       = u + v;
+                x[i + j + len] = u - v;
+            }
+        }
+    }
+}
+
+// Forward transform: y = (1/sqrt(d)) * H * diag(signs) * x
+static void tbq_forward_transform(const float * x, float * y, int d, const int8_t * signs) {
+    // Apply random signs
+    for (int i = 0; i < d; i++) {
+        y[i] = x[i] * signs[i];
+    }
+    // WHT
+    tbq_wht_inplace(y, d);
+    // Normalize by 1/sqrt(d)
+    float inv_sqrt_d = 1.0f / sqrtf((float)d);
+    for (int i = 0; i < d; i++) {
+        y[i] *= inv_sqrt_d;
+    }
+}
+
+// Inverse transform: x = diag(signs) * H * (1/sqrt(d)) * y
+// Since H is self-inverse (up to scaling) and signs are self-inverse
+static void tbq_inverse_transform(const float * y, float * x, int d, const int8_t * signs) {
+    // Copy y to x
+    for (int i = 0; i < d; i++) {
+        x[i] = y[i];
+    }
+    // WHT (self-inverse up to 1/d scaling, combined with forward's 1/sqrt(d) gives 1/sqrt(d))
+    tbq_wht_inplace(x, d);
+    // Normalize by 1/sqrt(d) and undo signs
+    float inv_sqrt_d = 1.0f / sqrtf((float)d);
+    for (int i = 0; i < d; i++) {
+        x[i] *= inv_sqrt_d * signs[i];
+    }
+}
+
+// --- Legacy rotation matrix support ---
+// Kept for backward compatibility with pre-computed Metal rotation constant.
+// The CPU path now uses the fast Hadamard transform.
 
 static void tbq_generate_rotation(int d, uint64_t seed, float * Q) {
     // Fill d x d with N(0,1)
     uint64_t state = seed;
-    for (int i = 0; i < d * d - 1; i += 2) {
-        tbq_box_muller(&state, &Q[i], &Q[i + 1]);
-    }
-    if ((d * d) % 2 != 0) {
-        float dummy;
-        tbq_box_muller(&state, &Q[d * d - 1], &dummy);
-    }
-
-    // Householder QR decomposition (in-place, overwrites Q with orthogonal matrix)
-    // We need workspace for the Householder vectors
-    float * v = (float *)malloc(d * sizeof(float));
-    float * tau = (float *)malloc(d * sizeof(float));
-
-    for (int j = 0; j < d; j++) {
-        // Compute Householder vector for column j
-        float norm_sq = 0.0f;
-        for (int i = j; i < d; i++) {
-            norm_sq += Q[i * d + j] * Q[i * d + j];
-        }
-        float norm = sqrtf(norm_sq);
-        float sign = Q[j * d + j] >= 0.0f ? 1.0f : -1.0f;
-        float alpha = -sign * norm;
-
-        // v = column below diagonal, with v[0] adjusted
-        for (int i = j; i < d; i++) {
-            v[i - j] = Q[i * d + j];
-        }
-        v[0] -= alpha;
-
-        // tau = 2 / (v^T v)
-        float vtv = 0.0f;
-        for (int i = 0; i < d - j; i++) {
-            vtv += v[i] * v[i];
-        }
-        tau[j] = vtv > 0.0f ? 2.0f / vtv : 0.0f;
-
-        // Apply Householder to trailing submatrix: Q[j:,j:] -= tau * v * (v^T * Q[j:,j:])
-        for (int k = j; k < d; k++) {
-            float dot = 0.0f;
-            for (int i = 0; i < d - j; i++) {
-                dot += v[i] * Q[(i + j) * d + k];
-            }
-            for (int i = 0; i < d - j; i++) {
-                Q[(i + j) * d + k] -= tau[j] * v[i] * dot;
-            }
-        }
-    }
-
-    // Extract Q from the implicit representation:
-    // Start with identity, apply Householder reflectors in reverse
-    // Actually, the matrix is already transformed — the upper triangle contains R,
-    // and we need to reconstruct Q explicitly.
-
-    // Simpler approach: the above modified Q in-place. Let's extract Q properly.
-    // Re-do from scratch with explicit Q accumulation.
-
-    // Reset: regenerate the random matrix A
-    state = seed;
     float * A = (float *)malloc(d * d * sizeof(float));
     for (int i = 0; i < d * d - 1; i += 2) {
         tbq_box_muller(&state, &A[i], &A[i + 1]);
@@ -2435,14 +2442,11 @@ static void tbq_generate_rotation(int d, uint64_t seed, float * Q) {
         tbq_box_muller(&state, &A[d * d - 1], &dummy);
     }
 
-    // Modified Gram-Schmidt for QR (simpler, gives Q directly)
-    // Q columns are orthonormal basis from A columns
+    // Modified Gram-Schmidt for QR
     for (int j = 0; j < d; j++) {
-        // Copy column j of A into Q column j
         for (int i = 0; i < d; i++) {
             Q[i * d + j] = A[i * d + j];
         }
-        // Subtract projections onto previous Q columns
         for (int k = 0; k < j; k++) {
             float dot = 0.0f;
             for (int i = 0; i < d; i++) {
@@ -2452,7 +2456,6 @@ static void tbq_generate_rotation(int d, uint64_t seed, float * Q) {
                 Q[i * d + j] -= dot * Q[i * d + k];
             }
         }
-        // Normalize
         float norm = 0.0f;
         for (int i = 0; i < d; i++) {
             norm += Q[i * d + j] * Q[i * d + j];
@@ -2465,9 +2468,7 @@ static void tbq_generate_rotation(int d, uint64_t seed, float * Q) {
         }
     }
 
-    // Haar sign correction: ensure deterministic orientation
-    // (Without this, the sign of each column is arbitrary)
-    // Convention: make diagonal of R positive by flipping Q columns where R_jj < 0
+    // Haar sign correction
     for (int j = 0; j < d; j++) {
         float r_jj = 0.0f;
         for (int i = 0; i < d; i++) {
@@ -2481,8 +2482,6 @@ static void tbq_generate_rotation(int d, uint64_t seed, float * Q) {
     }
 
     free(A);
-    free(v);
-    free(tau);
 }
 
 // --- Thread-local rotation matrix cache ---
@@ -2492,7 +2491,7 @@ static uint64_t tbq_seed_for_dim(int d) {
     return 0x54425131ULL ^ (uint64_t)d;  // "TBQ1" XOR dim
 }
 
-// Cache rotation matrices per dimension
+// Cache rotation matrices per dimension (legacy, for Metal path)
 // Thread-local to avoid synchronization in multi-threaded quantization
 #define TBQ_MAX_CACHED_DIMS 4
 typedef struct {
@@ -2528,6 +2527,39 @@ static const float * tbq_get_rotation(int d) {
         tbq_cache[TBQ_MAX_CACHED_DIMS - 1].matrix = Q;
     }
     return Q;
+}
+
+// --- Sign vector cache for Hadamard transform ---
+typedef struct {
+    int dim;
+    int8_t * signs;
+} tbq_sign_cache_entry;
+
+static _Thread_local tbq_sign_cache_entry tbq_sign_cache[TBQ_MAX_CACHED_DIMS] = {{0}};
+static _Thread_local int tbq_sign_cache_count = 0;
+
+static const int8_t * tbq_get_signs(int d) {
+    for (int i = 0; i < tbq_sign_cache_count; i++) {
+        if (tbq_sign_cache[i].dim == d) {
+            return tbq_sign_cache[i].signs;
+        }
+    }
+    int8_t * s = (int8_t *)malloc(d * sizeof(int8_t));
+    tbq_generate_signs(d, tbq_seed_for_dim(d), s);
+
+    if (tbq_sign_cache_count < TBQ_MAX_CACHED_DIMS) {
+        tbq_sign_cache[tbq_sign_cache_count].dim = d;
+        tbq_sign_cache[tbq_sign_cache_count].signs = s;
+        tbq_sign_cache_count++;
+    } else {
+        free(tbq_sign_cache[0].signs);
+        for (int i = 0; i < TBQ_MAX_CACHED_DIMS - 1; i++) {
+            tbq_sign_cache[i] = tbq_sign_cache[i + 1];
+        }
+        tbq_sign_cache[TBQ_MAX_CACHED_DIMS - 1].dim = d;
+        tbq_sign_cache[TBQ_MAX_CACHED_DIMS - 1].signs = s;
+    }
+    return s;
 }
 
 // --- Lloyd-Max codebook (universal N(0,1), scaled by 1/sqrt(d) at runtime) ---
@@ -2584,7 +2616,8 @@ static void tbq_unpack_3bit(uint8_t * out, const uint8_t * in, int n) {
 }
 
 // --- Quantize: float -> TurboQuant blocks ---
-// Each block is self-contained: own norm, own rotation over QK_TBQ elements.
+// Each block is self-contained: own norm, own transform over QK_TBQ elements.
+// Uses randomized Hadamard transform (O(n log n)) for decorrelation.
 // This is required because llama.cpp views KV cache per-head, and each head
 // must be independently dequantizable.
 
@@ -2592,7 +2625,7 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
     assert(k % QK_TBQ == 0);
     const int64_t nb = k / QK_TBQ;
 
-    const float * Q = tbq_get_rotation(QK_TBQ);
+    const int8_t * signs = tbq_get_signs(QK_TBQ);
     const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
 
     float boundaries[7];
@@ -2619,17 +2652,14 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
             continue;
         }
 
-        y[bi].d = GGML_FP32_TO_FP16(norm);
         float inv_norm = 1.0f / norm;
 
-        // 2. Normalize and rotate: rotated = Q * (bx / norm)
+        // 2. Normalize and apply randomized Hadamard transform
+        float normalized[QK_TBQ];
         for (int i = 0; i < QK_TBQ; i++) {
-            float sum = 0.0f;
-            for (int j = 0; j < QK_TBQ; j++) {
-                sum += Q[i * QK_TBQ + j] * bx[j] * inv_norm;
-            }
-            rotated[i] = sum;
+            normalized[i] = bx[i] * inv_norm;
         }
+        tbq_forward_transform(normalized, rotated, QK_TBQ, signs);
 
         // 3. Quantize via boundary lookup
         for (int i = 0; i < QK_TBQ; i++) {
@@ -2640,7 +2670,23 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
             indices[i] = idx;
         }
 
-        // 4. Pack
+        // 4. Compute norm correction: find scale that minimizes MSE
+        // between original rotated values and centroid reconstruction.
+        // corrected_norm = norm * (rotated · centroids) / (centroids · centroids)
+        float centroids_scaled[8];
+        for (int i = 0; i < 8; i++) {
+            centroids_scaled[i] = tbq3_centroids_unit[i] * inv_sqrt_d;
+        }
+        float dot_rc = 0.0f, dot_cc = 0.0f;
+        for (int i = 0; i < QK_TBQ; i++) {
+            float c = centroids_scaled[indices[i]];
+            dot_rc += rotated[i] * c;
+            dot_cc += c * c;
+        }
+        float corrected_norm = (dot_cc > 1e-20f) ? norm * (dot_rc / dot_cc) : norm;
+        y[bi].d = GGML_FP32_TO_FP16(corrected_norm);
+
+        // 5. Pack
         tbq_pack_3bit(y[bi].qs, indices, QK_TBQ);
     }
 }
@@ -2649,12 +2695,17 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
     assert(k % QK_TBQ == 0);
     const int64_t nb = k / QK_TBQ;
 
-    const float * Q = tbq_get_rotation(QK_TBQ);
+    const int8_t * signs = tbq_get_signs(QK_TBQ);
     const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
 
     float boundaries[15];
     for (int i = 0; i < 15; i++) {
         boundaries[i] = tbq4_boundaries_unit[i] * inv_sqrt_d;
+    }
+
+    float centroids_scaled[16];
+    for (int i = 0; i < 16; i++) {
+        centroids_scaled[i] = tbq4_centroids_unit[i] * inv_sqrt_d;
     }
 
     float rotated[QK_TBQ];
@@ -2675,19 +2726,17 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
             continue;
         }
 
-        y[bi].d = GGML_FP32_TO_FP16(norm);
         float inv_norm = 1.0f / norm;
 
-        // 2. Normalize and rotate
+        // 2. Normalize and apply randomized Hadamard transform
+        float normalized[QK_TBQ];
         for (int i = 0; i < QK_TBQ; i++) {
-            float sum = 0.0f;
-            for (int j = 0; j < QK_TBQ; j++) {
-                sum += Q[i * QK_TBQ + j] * bx[j] * inv_norm;
-            }
-            rotated[i] = sum;
+            normalized[i] = bx[i] * inv_norm;
         }
+        tbq_forward_transform(normalized, rotated, QK_TBQ, signs);
 
-        // 3. Quantize and pack into nibbles
+        // 3. Quantize and pack into nibbles, tracking indices for norm correction
+        uint8_t idx_all[QK_TBQ];
         for (int i = 0; i < QK_TBQ / 2; i++) {
             float val_lo = rotated[2 * i];
             float val_hi = rotated[2 * i + 1];
@@ -2701,19 +2750,31 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
                 if (val_hi > boundaries[b]) idx_hi = b + 1;
             }
 
+            idx_all[2 * i]     = idx_lo;
+            idx_all[2 * i + 1] = idx_hi;
             y[bi].qs[i] = idx_lo | (idx_hi << 4);
         }
+
+        // 4. Norm correction: minimize MSE by optimal scaling
+        float dot_rc = 0.0f, dot_cc = 0.0f;
+        for (int i = 0; i < QK_TBQ; i++) {
+            float c = centroids_scaled[idx_all[i]];
+            dot_rc += rotated[i] * c;
+            dot_cc += c * c;
+        }
+        float corrected_norm = (dot_cc > 1e-20f) ? norm * (dot_rc / dot_cc) : norm;
+        y[bi].d = GGML_FP32_TO_FP16(corrected_norm);
     }
 }
 
 // --- Dequantize: TurboQuant blocks -> float ---
-// Each block is self-contained: read norm, unpack, inverse rotate, rescale.
+// Each block is self-contained: read norm, unpack, inverse Hadamard, rescale.
 
 void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TBQ == 0);
     const int64_t nb = k / QK_TBQ;
 
-    const float * Q = tbq_get_rotation(QK_TBQ);
+    const int8_t * signs = tbq_get_signs(QK_TBQ);
     const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
 
     float centroids[8];
@@ -2722,13 +2783,14 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
     }
 
     float rotated[QK_TBQ];
+    float unrotated[QK_TBQ];
     uint8_t indices[QK_TBQ];
 
     for (int64_t bi = 0; bi < nb; bi++) {
         float * by = y + bi * QK_TBQ;
         const float norm = GGML_FP16_TO_FP32(x[bi].d);
 
-        if (norm < 1e-10f) {
+        if (fabsf(norm) < 1e-10f) {
             for (int i = 0; i < QK_TBQ; i++) by[i] = 0.0f;
             continue;
         }
@@ -2739,13 +2801,10 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
             rotated[i] = centroids[indices[i]];
         }
 
-        // 2. Inverse rotation: by = Q^T * rotated, then rescale
+        // 2. Inverse Hadamard transform, then rescale by norm
+        tbq_inverse_transform(rotated, unrotated, QK_TBQ, signs);
         for (int j = 0; j < QK_TBQ; j++) {
-            float sum = 0.0f;
-            for (int i = 0; i < QK_TBQ; i++) {
-                sum += Q[i * QK_TBQ + j] * rotated[i];
-            }
-            by[j] = sum * norm;
+            by[j] = unrotated[j] * norm;
         }
     }
 }
@@ -2754,7 +2813,7 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     assert(k % QK_TBQ == 0);
     const int64_t nb = k / QK_TBQ;
 
-    const float * Q = tbq_get_rotation(QK_TBQ);
+    const int8_t * signs = tbq_get_signs(QK_TBQ);
     const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ);
 
     float centroids[16];
@@ -2763,12 +2822,13 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     }
 
     float rotated[QK_TBQ];
+    float unrotated[QK_TBQ];
 
     for (int64_t bi = 0; bi < nb; bi++) {
         float * by = y + bi * QK_TBQ;
         const float norm = GGML_FP16_TO_FP32(x[bi].d);
 
-        if (norm < 1e-10f) {
+        if (fabsf(norm) < 1e-10f) {
             for (int i = 0; i < QK_TBQ; i++) by[i] = 0.0f;
             continue;
         }
@@ -2779,13 +2839,10 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
             rotated[2 * i + 1] = centroids[x[bi].qs[i] >> 4];
         }
 
-        // 2. Inverse rotation and rescale
+        // 2. Inverse Hadamard transform and rescale
+        tbq_inverse_transform(rotated, unrotated, QK_TBQ, signs);
         for (int j = 0; j < QK_TBQ; j++) {
-            float sum = 0.0f;
-            for (int i = 0; i < QK_TBQ; i++) {
-                sum += Q[i * QK_TBQ + j] * rotated[i];
-            }
-            by[j] = sum * norm;
+            by[j] = unrotated[j] * norm;
         }
     }
 }

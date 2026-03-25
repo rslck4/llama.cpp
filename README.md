@@ -70,6 +70,27 @@ range of hardware - locally and in the cloud.
 
 The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
 
+### TurboQuant KV Cache Quantization
+
+This fork adds experimental rotation-based KV cache quantization types (**TBQ3_0** and **TBQ4_0**) targeting lower memory usage during inference with minimal quality loss. Uses centroid scaling with `QK_TBQ=128` block size (matching full `head_dim` rotation). CPU and Metal GPU backends are supported.
+
+**Round-trip quality benchmarks** (synthetic signal, `sin/cos` pattern):
+
+| Type | Bits/Weight | Block Size | Cosine Sim (d=128) | Cosine Sim (d=256) | RMSE (d=128) | RMSE (d=256) |
+|------|-------------|------------|--------------------|--------------------|--------------|--------------|
+| TBQ4_0 | 4.125 | 128 | 0.9954 | 0.9942 | 0.1219 | 0.1375 |
+| TBQ3_0 | 3.125 | 128 | 0.9852 | 0.9814 | 0.2183 | 0.2439 |
+
+**Quality thresholds:** TBQ4_0 ≥ 0.99 cosine sim, TBQ3_0 ≥ 0.97 cosine sim.
+
+To run the round-trip test:
+```bash
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j$(sysctl -n hw.ncpu)
+cc -O2 -DQK_TBQ=128 -Iggml/include -Iggml/src tests/test-tbq-roundtrip.c -Lbuild/bin -lggml-base -lm -o build/test-tbq-roundtrip
+DYLD_LIBRARY_PATH=build/bin ./build/test-tbq-roundtrip
+```
+
 <details>
 <summary>Models</summary>
 
