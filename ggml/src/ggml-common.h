@@ -268,20 +268,22 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 
 // TurboQuant KV cache compression (arxiv 2504.19874)
 // Block size = 128 (matches common head_dim). Algorithm 1: rotation → Lloyd-Max quantization.
-// d field stores L2 norm of original vector (in first block; 0 in subsequent blocks).
-#define QK_TBQ 64
+// d field stores L2 norm of original vector.
+// Full head_dim rotation is critical for quality — splitting heads into smaller blocks
+// loses cross-dimension correlations and degrades attention accuracy.
+#define QK_TBQ 128
 
-// 3.25 bpw (3 bits/coord + amortized norm) — ~4.9x compression vs FP16
+// 3.125 bpw (3 bits/coord + amortized norm) — ~5.1x compression vs FP16
 typedef struct {
-    uint8_t qs[QK_TBQ * 3 / 8]; // 24 bytes: packed 3-bit codebook indices
-    ggml_half d;                 // L2 norm (block 0 of vector) or 0 (blocks 1+)
+    uint8_t qs[QK_TBQ * 3 / 8]; // 48 bytes: packed 3-bit codebook indices
+    ggml_half d;                 // L2 norm of original vector
 } block_tbq3_0;
 static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_TBQ * 3 / 8, "wrong tbq3_0 block size/padding");
 
-// 4.5 bpw (4 bits/coord + amortized norm) — ~3.6x compression vs FP16
+// 4.125 bpw (4 bits/coord + amortized norm) — ~3.9x compression vs FP16
 typedef struct {
-    uint8_t qs[QK_TBQ / 2];     // 32 bytes: packed 4-bit nibble indices
-    ggml_half d;                 // L2 norm (block 0 of vector) or 0 (blocks 1+)
+    uint8_t qs[QK_TBQ / 2];     // 64 bytes: packed 4-bit nibble indices
+    ggml_half d;                 // L2 norm of original vector
 } block_tbq4_0;
 static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ / 2, "wrong tbq4_0 block size/padding");
 

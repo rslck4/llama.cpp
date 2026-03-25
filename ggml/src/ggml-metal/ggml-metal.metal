@@ -9053,9 +9053,9 @@ kernel void kernel_set_rows_q32(
     }
 }
 
-// TBQ variant: 64 elements per block (QK_TBQ=64)
+// TBQ variant: 128 elements per block (QK_TBQ=128)
 template<typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
-kernel void kernel_set_rows_q64(
+kernel void kernel_set_rows_tbq(
         constant ggml_metal_kargs_set_rows & args,
         device const  void * src0,
         device const  void * src1,
@@ -9857,9 +9857,9 @@ template [[host_name("kernel_get_rows_iq1_m")]]   kernel get_rows_q_t kernel_get
 template [[host_name("kernel_get_rows_iq4_nl")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_nl,  2,     dequantize_iq4_nl>;
 template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
 
-// TBQ GET_ROWS: nl=4 because QK_TBQ=64 / 16 = 4 interleave groups
-template [[host_name("kernel_get_rows_tbq4_0")]]  kernel get_rows_q_t kernel_get_rows_q<block_tbq4_0, 4, dequantize_tbq4_0>;
-template [[host_name("kernel_get_rows_tbq3_0")]]  kernel get_rows_q_t kernel_get_rows_q<block_tbq3_0, 4, dequantize_tbq3_0>;
+// TBQ GET_ROWS: nl=8 because QK_TBQ=128 / 16 = 8 interleave groups
+template [[host_name("kernel_get_rows_tbq4_0")]]  kernel get_rows_q_t kernel_get_rows_q<block_tbq4_0, 8, dequantize_tbq4_0>;
+template [[host_name("kernel_get_rows_tbq3_0")]]  kernel get_rows_q_t kernel_get_rows_q<block_tbq3_0, 8, dequantize_tbq3_0>;
 
 //
 // set rows
@@ -9891,13 +9891,13 @@ template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
 
-// TBQ SET_ROWS: uses q64 template (QK_TBQ=64 elements per block)
-typedef decltype(kernel_set_rows_q64<int64_t, block_tbq4_0, quantize_tbq4_0>) set_rows_q64_t;
+// TBQ SET_ROWS: uses tbq template (QK_TBQ=128 elements per block)
+typedef decltype(kernel_set_rows_tbq<int64_t, block_tbq4_0, quantize_tbq4_0>) set_rows_tbq_t;
 
-template [[host_name("kernel_set_rows_tbq4_0_i64")]] kernel set_rows_q64_t kernel_set_rows_q64<int64_t, block_tbq4_0, quantize_tbq4_0>;
-template [[host_name("kernel_set_rows_tbq4_0_i32")]] kernel set_rows_q64_t kernel_set_rows_q64<int32_t, block_tbq4_0, quantize_tbq4_0>;
-template [[host_name("kernel_set_rows_tbq3_0_i64")]] kernel set_rows_q64_t kernel_set_rows_q64<int64_t, block_tbq3_0, quantize_tbq3_0>;
-template [[host_name("kernel_set_rows_tbq3_0_i32")]] kernel set_rows_q64_t kernel_set_rows_q64<int32_t, block_tbq3_0, quantize_tbq3_0>;
+template [[host_name("kernel_set_rows_tbq4_0_i64")]] kernel set_rows_tbq_t kernel_set_rows_tbq<int64_t, block_tbq4_0, quantize_tbq4_0>;
+template [[host_name("kernel_set_rows_tbq4_0_i32")]] kernel set_rows_tbq_t kernel_set_rows_tbq<int32_t, block_tbq4_0, quantize_tbq4_0>;
+template [[host_name("kernel_set_rows_tbq3_0_i64")]] kernel set_rows_tbq_t kernel_set_rows_tbq<int64_t, block_tbq3_0, quantize_tbq3_0>;
+template [[host_name("kernel_set_rows_tbq3_0_i32")]] kernel set_rows_tbq_t kernel_set_rows_tbq<int32_t, block_tbq3_0, quantize_tbq3_0>;
 
 //
 // matrix-matrix multiplication
