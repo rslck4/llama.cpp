@@ -3,6 +3,48 @@
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+----
+
+## TurboQuant KV Cache Compression
+
+This fork implements **TurboQuant** ([arxiv 2504.19874](https://arxiv.org/abs/2504.19874)), a KV cache quantization method that compresses key and value caches during inference. Two new cache types are available: **TBQ4_0** (4-bit, ~4x compression) and **TBQ3_0** (3-bit, ~5.3x compression).
+
+### How it works
+
+1. **Normalize** — store the L2 norm, work with the unit vector
+2. **Walsh-Hadamard Transform** — O(d log d) orthogonal rotation induces near-i.i.d. coordinates
+3. **Lloyd-Max scalar quantization** — optimal codebook for the resulting distribution
+
+Dequantization reverses the process: centroid lookup, inverse WHT, rescale by norm. The Metal backend computes Q*K dot products directly in the transformed domain, avoiding the inverse transform entirely.
+
+### Usage
+
+```bash
+# 4-bit K-cache, f16 V-cache
+llama-cli -m model.gguf --cache-type-k tbq4_0 --cache-type-v f16 -ngl 99
+
+# 4-bit K+V cache (requires flash attention)
+llama-cli -m model.gguf --cache-type-k tbq4_0 --cache-type-v tbq4_0 -fa on -ngl 99
+
+# 3-bit K+V cache
+llama-cli -m model.gguf --cache-type-k tbq3_0 --cache-type-v tbq3_0 -fa on -ngl 99
+```
+
+### Compatibility
+
+- **Requires head_dim = 128** (matches QK_TBQ block size). Models with different head dimensions automatically fall back to f16.
+- **Validated on:** Llama 3.1 8B Instruct — 5/5 prompts correct across all configs (K-only, K+V, TBQ3, TBQ4)
+- **Backends:** CPU and Metal (Apple Silicon). Metal flash attention with SIMD-cooperative WHT.
+
+### Quality
+
+| Type | Cosine Similarity | Compression |
+|------|-------------------|-------------|
+| TBQ4_0 | >= 0.996 | 4x |
+| TBQ3_0 | >= 0.984 | 5.3x |
+
+----
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
 [![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
 
