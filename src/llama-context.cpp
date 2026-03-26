@@ -2942,6 +2942,32 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
+    // TBQ types require head_dim divisible by QK_TBQ (block size). If any layer's
+    // head dimension is incompatible, fall back to Q8_0 with a warning instead of
+    // failing hard. This handles models like Qwen whose head_dim ≠ 128.
+    auto tbq_fallback_if_needed = [&](ggml_type & type, const char * cache_name,
+                                      auto get_head_dim) {
+        if (type != GGML_TYPE_TBQ3_0 && type != GGML_TYPE_TBQ4_0) {
+            return;
+        }
+        const uint32_t blck_size = ggml_blck_size(type);
+        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+            const uint32_t head_dim = get_head_dim(il);
+            if (head_dim % blck_size != 0) {
+                LLAMA_LOG_WARN("%s: %s cache type %s requires head_dim divisible by %u, "
+                    "but layer %u has head_dim=%u — falling back to q8_0\n",
+                    __func__, cache_name, ggml_type_name(type), blck_size, il, head_dim);
+                type = GGML_TYPE_Q8_0;
+                return;
+            }
+        }
+    };
+
+    tbq_fallback_if_needed(params.type_k, "K",
+        [&](uint32_t il) { return model->hparams.n_embd_head_k(il); });
+    tbq_fallback_if_needed(params.type_v, "V",
+        [&](uint32_t il) { return model->hparams.n_embd_head_v(il); });
+
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {

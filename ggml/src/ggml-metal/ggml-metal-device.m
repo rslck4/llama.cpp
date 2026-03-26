@@ -1159,9 +1159,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
-            // TBQ types not yet supported in flash attention (rotation-coupled dequantize)
+            // TBQ requires head_dim divisible by QK_TBQ (block size). Reject if
+            // the model's head_dim doesn't fit, so ggml falls back to CPU path.
             if (op->src[1]->type == GGML_TYPE_TBQ3_0 || op->src[1]->type == GGML_TYPE_TBQ4_0) {
-                return false;
+                const int64_t dk = op->src[1]->ne[0];
+                const uint64_t blck_size = ggml_blck_size(op->src[1]->type);
+                if (dk % (int64_t)blck_size != 0) {
+                    return false;
+                }
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:

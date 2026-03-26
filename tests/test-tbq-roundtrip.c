@@ -24,8 +24,13 @@ int main(void) {
 
     for (int di = 0; di < ndims; di++) {
         int d = dims[di];
+        printf("\n=== d=%d ===\n", d);
+        if (d % QK_TBQ != 0) {
+            printf("SKIP: d=%d not divisible by QK_TBQ=%d\n", d, QK_TBQ);
+            continue;
+        }
         int nb = d / QK_TBQ;
-        printf("\n=== d=%d (nb=%d blocks) ===\n", d, nb);
+        printf("nb=%d blocks\n", nb);
 
         float * x = (float *)malloc(d * sizeof(float));
         float * y = (float *)calloc(d, sizeof(float));

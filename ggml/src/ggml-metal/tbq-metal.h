@@ -282,6 +282,179 @@ void dequantize_tbq3_0(device const block_tbq3_0 * xb, short il, thread type4x4 
     reg = (type4x4) reg_f;
 }
 
+// --- TBQ4 dequantize (type4 interface for flash_attn_ext_vec) ---
+// Produces 4 floats from a 128-element block. il selects which 4 (0..31).
+// Fallback: each thread does full 128-element inverse WHT independently.
+// Used for NE>1 instantiations where il != tiisg.
+template <typename type4>
+void dequantize_tbq4_0_t4(device const block_tbq4_0 * xb, short il, thread type4 & reg) {
+    float norm = float(xb->d);
+
+    if (abs(norm) < 1e-10f) {
+        for (int i = 0; i < 4; i++) reg[i] = 0.0f;
+        return;
+    }
+
+    // Unpack all 128 nibbles to centroids
+    float rotated[QK_TBQ];
+    for (int i = 0; i < QK_TBQ/2; i++) {
+        rotated[2*i    ] = tbq4_centroids_scaled[xb->qs[i] & 0x0F];
+        rotated[2*i + 1] = tbq4_centroids_scaled[xb->qs[i] >> 4];
+    }
+
+    // Inverse Hadamard transform
+    float unrotated[QK_TBQ];
+    tbq_inverse_transform(rotated, unrotated, QK_TBQ);
+
+    // Select the 4 elements for this il
+    int base = il * 4;
+    for (int i = 0; i < 4; i++) {
+        reg[i] = unrotated[base + i] * norm;
+    }
+}
+
+// --- TBQ3 dequantize (type4 interface for flash_attn_ext_vec) ---
+// Fallback: each thread does full 128-element inverse WHT independently.
+template <typename type4>
+void dequantize_tbq3_0_t4(device const block_tbq3_0 * xb, short il, thread type4 & reg) {
+    float norm = float(xb->d);
+
+    if (abs(norm) < 1e-10f) {
+        for (int i = 0; i < 4; i++) reg[i] = 0.0f;
+        return;
+    }
+
+    // Unpack 3-bit indices and map to centroids
+    float rotated[QK_TBQ];
+    for (int g = 0; g < QK_TBQ / 8; g++) {
+        uint32_t packed = (uint32_t)xb->qs[g*3 + 0]
+                        | ((uint32_t)xb->qs[g*3 + 1] << 8)
+                        | ((uint32_t)xb->qs[g*3 + 2] << 16);
+        for (int j = 0; j < 8; j++) {
+            uint8_t idx = (packed >> (j * 3)) & 7;
+            rotated[g*8 + j] = tbq3_centroids_scaled[idx];
+        }
+    }
+
+    // Inverse Hadamard transform
+    float unrotated[QK_TBQ];
+    tbq_inverse_transform(rotated, unrotated, QK_TBQ);
+
+    // Select the 4 elements for this il
+    int base = il * 4;
+    for (int i = 0; i < 4; i++) {
+        reg[i] = unrotated[base + i] * norm;
+    }
+}
+
+// --- SIMD-cooperative inverse WHT ---
+// 32 threads cooperatively compute a 128-element WHT using simd_shuffle.
+// Each thread holds 4 contiguous elements: thread t holds [4t..4t+3].
+// REQUIREMENT: il must equal tiisg (guaranteed for NE=1 flash_attn_ext_vec).
+inline void tbq_inverse_wht_simd(thread float * x, short il) {
+    // Stage len=1: butterfly between adjacent pairs (intra-thread)
+    {
+        float u0 = x[0], v0 = x[1];
+        x[0] = u0 + v0; x[1] = u0 - v0;
+        float u1 = x[2], v1 = x[3];
+        x[2] = u1 + v1; x[3] = u1 - v1;
+    }
+
+    // Stage len=2: butterfly between elements 2 apart (intra-thread)
+    {
+        float u0 = x[0], v0 = x[2];
+        x[0] = u0 + v0; x[2] = u0 - v0;
+        float u1 = x[1], v1 = x[3];
+        x[1] = u1 + v1; x[3] = u1 - v1;
+    }
+
+    // Stages len=4,8,16,32,64: cross-thread butterflies via simd_shuffle
+    // At each stage, thread pairs at distance 'stride' exchange and combine.
+    // stride = len/4 because each thread holds 4 elements.
+    for (short stride = 1; stride <= 16; stride <<= 1) {
+        ushort partner = il ^ stride;
+        float p0 = simd_shuffle(x[0], partner);
+        float p1 = simd_shuffle(x[1], partner);
+        float p2 = simd_shuffle(x[2], partner);
+        float p3 = simd_shuffle(x[3], partner);
+
+        if ((il & stride) == 0) {
+            // Lower half of butterfly: x[i+j] = u + v
+            x[0] += p0; x[1] += p1; x[2] += p2; x[3] += p3;
+        } else {
+            // Upper half of butterfly: x[i+j+len] = u - v
+            x[0] = p0 - x[0]; x[1] = p1 - x[1];
+            x[2] = p2 - x[2]; x[3] = p3 - x[3];
+        }
+    }
+}
+
+// --- TBQ4 dequantize (SIMD-cooperative type4 for flash_attn_ext_vec NE=1) ---
+// All 32 simdgroup threads must call this on the SAME block simultaneously
+// with il == tiisg. Computes one cooperative WHT instead of 32 independent ones.
+template <typename type4>
+void dequantize_tbq4_0_t4_simd(device const block_tbq4_0 * xb, short il, thread type4 & reg) {
+    float norm = float(xb->d);
+
+    if (abs(norm) < 1e-10f) {
+        for (int i = 0; i < 4; i++) reg[i] = 0.0f;
+        return;
+    }
+
+    // Each thread unpacks only its own 4 centroids (not all 128)
+    uint8_t qb0 = xb->qs[il * 2];
+    uint8_t qb1 = xb->qs[il * 2 + 1];
+    float x[4] = {
+        tbq4_centroids_scaled[qb0 & 0x0F],
+        tbq4_centroids_scaled[qb0 >> 4],
+        tbq4_centroids_scaled[qb1 & 0x0F],
+        tbq4_centroids_scaled[qb1 >> 4],
+    };
+
+    // Cooperative inverse WHT across all 32 simdgroup threads
+    tbq_inverse_wht_simd(x, il);
+
+    // Apply 1/sqrt(d) scaling, sign flip, and norm
+    int base = il * 4;
+    const float inv_sqrt_d = 1.0f / 11.313708498984761f; // 1/sqrt(128)
+    for (int i = 0; i < 4; i++) {
+        reg[i] = x[i] * inv_sqrt_d * tbq_signs_128[base + i] * norm;
+    }
+}
+
+// --- TBQ3 dequantize (SIMD-cooperative type4 for flash_attn_ext_vec NE=1) ---
+template <typename type4>
+void dequantize_tbq3_0_t4_simd(device const block_tbq3_0 * xb, short il, thread type4 & reg) {
+    float norm = float(xb->d);
+
+    if (abs(norm) < 1e-10f) {
+        for (int i = 0; i < 4; i++) reg[i] = 0.0f;
+        return;
+    }
+
+    // Each thread unpacks only its own 4 centroids from 3-bit packing
+    int g = il / 2;
+    int pos_ofs = (il % 2) * 4;
+    uint32_t packed = (uint32_t)xb->qs[g*3 + 0]
+                    | ((uint32_t)xb->qs[g*3 + 1] << 8)
+                    | ((uint32_t)xb->qs[g*3 + 2] << 16);
+    float x[4];
+    for (int j = 0; j < 4; j++) {
+        uint8_t idx = (packed >> ((pos_ofs + j) * 3)) & 7;
+        x[j] = tbq3_centroids_scaled[idx];
+    }
+
+    // Cooperative inverse WHT across all 32 simdgroup threads
+    tbq_inverse_wht_simd(x, il);
+
+    // Apply 1/sqrt(d) scaling, sign flip, and norm
+    int base = il * 4;
+    const float inv_sqrt_d = 1.0f / 11.313708498984761f; // 1/sqrt(128)
+    for (int i = 0; i < 4; i++) {
+        reg[i] = x[i] * inv_sqrt_d * tbq_signs_128[base + i] * norm;
+    }
+}
+
 // --- TBQ4 MUL_MV kernel ---
 // Computes dot product of quantized TBQ4 row with F32 vector.
 // Optimization: transform the y vector, then dot in transform domain.

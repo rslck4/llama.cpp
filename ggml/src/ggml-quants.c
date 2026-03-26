@@ -2337,28 +2337,16 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
 }
 
 // ====================== TurboQuant KV cache compression (arxiv 2504.19874)
-// Algorithm 1 (TurboQuant_mse): random rotation → Lloyd-Max scalar quantization
-// Rotation matrix generated deterministically from seeded PRNG via Householder QR.
+// Algorithm 1 (TurboQuant_mse): randomized Hadamard transform → Lloyd-Max scalar quantization
+// Decorrelation via fast Walsh-Hadamard transform with random sign flips.
 
-// --- PRNG: splitmix64 for deterministic rotation matrix generation ---
+// --- PRNG: splitmix64 for deterministic sign vector generation ---
 
 static uint64_t tbq_splitmix64(uint64_t * state) {
     uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
     return z ^ (z >> 31);
-}
-
-// Box-Muller: two uniform -> two gaussian
-static void tbq_box_muller(uint64_t * state, float * g1, float * g2) {
-    uint64_t u1_bits = tbq_splitmix64(state);
-    uint64_t u2_bits = tbq_splitmix64(state);
-    // Map to (0, 1) — avoid exact 0
-    double u1 = ((double)(u1_bits >> 11) + 0.5) / (double)(1ULL << 53);
-    double u2 = ((double)(u2_bits >> 11) + 0.5) / (double)(1ULL << 53);
-    double r = sqrt(-2.0 * log(u1));
-    *g1 = (float)(r * cos(2.0 * M_PI * u2));
-    *g2 = (float)(r * sin(2.0 * M_PI * u2));
 }
 
 // --- Randomized Hadamard Transform ---
@@ -2426,108 +2414,14 @@ static void tbq_inverse_transform(const float * y, float * x, int d, const int8_
     }
 }
 
-// --- Legacy rotation matrix support ---
-// Kept for backward compatibility with pre-computed Metal rotation constant.
-// The CPU path now uses the fast Hadamard transform.
-
-static void tbq_generate_rotation(int d, uint64_t seed, float * Q) {
-    // Fill d x d with N(0,1)
-    uint64_t state = seed;
-    float * A = (float *)malloc(d * d * sizeof(float));
-    for (int i = 0; i < d * d - 1; i += 2) {
-        tbq_box_muller(&state, &A[i], &A[i + 1]);
-    }
-    if ((d * d) % 2 != 0) {
-        float dummy;
-        tbq_box_muller(&state, &A[d * d - 1], &dummy);
-    }
-
-    // Modified Gram-Schmidt for QR
-    for (int j = 0; j < d; j++) {
-        for (int i = 0; i < d; i++) {
-            Q[i * d + j] = A[i * d + j];
-        }
-        for (int k = 0; k < j; k++) {
-            float dot = 0.0f;
-            for (int i = 0; i < d; i++) {
-                dot += Q[i * d + k] * Q[i * d + j];
-            }
-            for (int i = 0; i < d; i++) {
-                Q[i * d + j] -= dot * Q[i * d + k];
-            }
-        }
-        float norm = 0.0f;
-        for (int i = 0; i < d; i++) {
-            norm += Q[i * d + j] * Q[i * d + j];
-        }
-        norm = sqrtf(norm);
-        if (norm > 0.0f) {
-            for (int i = 0; i < d; i++) {
-                Q[i * d + j] /= norm;
-            }
-        }
-    }
-
-    // Haar sign correction
-    for (int j = 0; j < d; j++) {
-        float r_jj = 0.0f;
-        for (int i = 0; i < d; i++) {
-            r_jj += Q[i * d + j] * A[i * d + j];
-        }
-        if (r_jj < 0.0f) {
-            for (int i = 0; i < d; i++) {
-                Q[i * d + j] = -Q[i * d + j];
-            }
-        }
-    }
-
-    free(A);
-}
-
-// --- Thread-local rotation matrix cache ---
+// --- Thread-local caching for Hadamard transform ---
 
 // Seed for a given head dimension (deterministic, fixed)
 static uint64_t tbq_seed_for_dim(int d) {
     return 0x54425131ULL ^ (uint64_t)d;  // "TBQ1" XOR dim
 }
 
-// Cache rotation matrices per dimension (legacy, for Metal path)
-// Thread-local to avoid synchronization in multi-threaded quantization
 #define TBQ_MAX_CACHED_DIMS 4
-typedef struct {
-    int dim;
-    float * matrix;  // row-major d x d
-} tbq_rotation_cache_entry;
-
-static _Thread_local tbq_rotation_cache_entry tbq_cache[TBQ_MAX_CACHED_DIMS] = {{0}};
-static _Thread_local int tbq_cache_count = 0;
-
-static const float * tbq_get_rotation(int d) {
-    // Check cache
-    for (int i = 0; i < tbq_cache_count; i++) {
-        if (tbq_cache[i].dim == d) {
-            return tbq_cache[i].matrix;
-        }
-    }
-    // Generate and cache
-    float * Q = (float *)malloc(d * d * sizeof(float));
-    tbq_generate_rotation(d, tbq_seed_for_dim(d), Q);
-
-    if (tbq_cache_count < TBQ_MAX_CACHED_DIMS) {
-        tbq_cache[tbq_cache_count].dim = d;
-        tbq_cache[tbq_cache_count].matrix = Q;
-        tbq_cache_count++;
-    } else {
-        // Evict oldest
-        free(tbq_cache[0].matrix);
-        for (int i = 0; i < TBQ_MAX_CACHED_DIMS - 1; i++) {
-            tbq_cache[i] = tbq_cache[i + 1];
-        }
-        tbq_cache[TBQ_MAX_CACHED_DIMS - 1].dim = d;
-        tbq_cache[TBQ_MAX_CACHED_DIMS - 1].matrix = Q;
-    }
-    return Q;
-}
 
 // --- Sign vector cache for Hadamard transform ---
 typedef struct {
@@ -2622,7 +2516,7 @@ static void tbq_unpack_3bit(uint8_t * out, const uint8_t * in, int n) {
 // must be independently dequantizable.
 
 void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
+    GGML_ASSERT(k % QK_TBQ == 0 && "TBQ3_0 requires row length divisible by QK_TBQ (128)");
     const int64_t nb = k / QK_TBQ;
 
     const int8_t * signs = tbq_get_signs(QK_TBQ);
@@ -2692,7 +2586,7 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
 }
 
 void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
+    GGML_ASSERT(k % QK_TBQ == 0 && "TBQ4_0 requires row length divisible by QK_TBQ (128)");
     const int64_t nb = k / QK_TBQ;
 
     const int8_t * signs = tbq_get_signs(QK_TBQ);
@@ -2771,7 +2665,7 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
 // Each block is self-contained: read norm, unpack, inverse Hadamard, rescale.
 
 void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
+    GGML_ASSERT(k % QK_TBQ == 0 && "TBQ3_0 dequantize requires row length divisible by QK_TBQ (128)");
     const int64_t nb = k / QK_TBQ;
 
     const int8_t * signs = tbq_get_signs(QK_TBQ);
@@ -2810,7 +2704,7 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
 }
 
 void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
+    GGML_ASSERT(k % QK_TBQ == 0 && "TBQ4_0 dequantize requires row length divisible by QK_TBQ (128)");
     const int64_t nb = k / QK_TBQ;
 
     const int8_t * signs = tbq_get_signs(QK_TBQ);

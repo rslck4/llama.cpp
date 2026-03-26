@@ -122,13 +122,17 @@ void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
 
 // TurboQuant vec_dot: dequantize full row, then F32 dot product.
 // Slow but correct — rotation couples all elements so block-level dot is impossible.
+// Stack buffer avoids per-call malloc; 4096 floats = 16 KB, safe for any thread stack.
+#define TBQ_VEC_DOT_STACK_MAX 4096
+
 void ggml_vec_dot_tbq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
 
-    float * tmp = (float *)malloc(n * sizeof(float));
+    float stack_buf[TBQ_VEC_DOT_STACK_MAX];
+    float * tmp = (n <= TBQ_VEC_DOT_STACK_MAX) ? stack_buf : (float *)malloc(n * sizeof(float));
     dequantize_row_tbq3_0((const block_tbq3_0 *)vx, tmp, n);
 
     const float * y = (const float *)vy;
@@ -137,7 +141,7 @@ void ggml_vec_dot_tbq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const vo
         sum += tmp[i] * y[i];
     }
     *s = sum;
-    free(tmp);
+    if (tmp != stack_buf) { free(tmp); }
 }
 
 void ggml_vec_dot_tbq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -146,7 +150,8 @@ void ggml_vec_dot_tbq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const vo
     UNUSED(by);
     UNUSED(bs);
 
-    float * tmp = (float *)malloc(n * sizeof(float));
+    float stack_buf[TBQ_VEC_DOT_STACK_MAX];
+    float * tmp = (n <= TBQ_VEC_DOT_STACK_MAX) ? stack_buf : (float *)malloc(n * sizeof(float));
     dequantize_row_tbq4_0((const block_tbq4_0 *)vx, tmp, n);
 
     const float * y = (const float *)vy;
@@ -155,7 +160,7 @@ void ggml_vec_dot_tbq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const vo
         sum += tmp[i] * y[i];
     }
     *s = sum;
-    free(tmp);
+    if (tmp != stack_buf) { free(tmp); }
 }
 
 //===================================== Q8_K ==============================================
